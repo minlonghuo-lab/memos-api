@@ -23,9 +23,9 @@
     /* Path alias */
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/client/*"]
     }
   },
-  "include": ["src", "src/vite-env.d.ts"],
+  "include": ["src/client", "src/client/vite-env.d.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

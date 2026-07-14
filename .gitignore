@@ -1,4 +1,8 @@
-/backend/node_modules
-/backend/.wrangler
-/backend/.dev.vars
+node_modules/
+.wrangler/
+.dev.vars
+dist/
+.env
+.env.local
+*.log
 /.claude

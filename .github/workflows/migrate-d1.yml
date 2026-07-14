@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       migration_file:
-        description: "Path to the migration SQL file under backend/"
+        description: "Path to the migration SQL file"
         required: true
         default: "migrations/add-tags-creator-id.sql"
       database_name:
-        description: "Cloudflare D1 database name from backend/wrangler.toml"
+        description: "Cloudflare D1 database name from wrangler.toml"
         required: true
         default: "memos_db"
 
@@ -16,10 +16,6 @@ jobs:
   migrate-d1:
     name: Run Remote D1 Migration
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,7 +33,7 @@ jobs:
         with:
           node-version: '22'
           cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -48,5 +44,5 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: "latest"
-          workingDirectory: backend
+          workingDirectory: .
           command: d1 execute ${{ github.event.inputs.database_name }} --remote --file=./${{ github.event.inputs.migration_file }}

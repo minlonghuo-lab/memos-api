@@ -1,13 +1,21 @@
 {
-  "name": "frontend",
+  "name": "cfmemos",
+  "version": "1.0.0",
   "private": true,
-  "version": "0.0.0",
   "type": "module",
+  "description": "A full-stack memo application for Cloudflare Workers",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build && cp -r functions dist/",
-    "lint": "eslint .",
-    "preview": "vite preview"
+    "dev": "npm run build:client && wrangler dev",
+    "dev:client": "vite",
+    "build:client": "vite build",
+    "build": "npm run build:client && wrangler deploy --dry-run",
+    "deploy": "npm run build:client && wrangler deploy",
+    "preview": "vite preview",
+    "lint": "eslint src/client",
+    "tail": "wrangler tail",
+    "db:create": "wrangler d1 create memos_db",
+    "db:init": "wrangler d1 execute memos_db --file=./schema.sql --remote",
+    "db:local": "wrangler d1 execute memos_db --local --file=./schema.sql"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",
@@ -16,12 +24,12 @@
     "@mui/joy": "^5.0.0-beta.52",
     "@reduxjs/toolkit": "^2.11.2",
     "@tanstack/react-query": "^5.90.12",
-    "@types/node": "^25.0.3",
     "axios": "^1.13.2",
     "classnames": "^2.5.1",
     "copy-to-clipboard": "^3.3.3",
     "date-fns": "^4.1.0",
     "highlight.js": "^11.11.1",
+    "hono": "^4.10.1",
     "i18next": "^25.7.3",
     "i18next-browser-languagedetector": "^8.2.0",
     "katex": "^0.16.27",
@@ -39,13 +47,14 @@
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
     "textarea-caret": "^3.1.0",
-    "typescript": "^5.9.3",
     "uuid": "^13.0.0",
     "zustand": "^5.0.9"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240117.0",
     "@eslint/js": "^9.39.1",
     "@types/lodash-es": "^4.17.12",
+    "@types/node": "^25.0.3",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "@types/uuid": "^10.0.0",
@@ -60,6 +69,9 @@
     "less": "^4.2.0",
     "postcss": "^8.4.31",
     "tailwindcss": "^3.3.5",
-    "vite": "^4.5.0"
-  }
+    "typescript": "^5.9.3",
+    "vite": "^4.5.0",
+    "wrangler": "4.95.0"
+  },
+  "license": "MIT"
 }

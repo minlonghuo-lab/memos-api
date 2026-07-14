@@ -326,13 +326,12 @@ app.get('/:filename', async (c) => {
     }
   }
 
-  // 如果不匹配文件格式，返回 404
-  return c.text('Not Found', 404);
+  return c.env.ASSETS.fetch(c.req.raw);
 });
 
-// 404 处理
+// API、RSS 和 R2 路由未命中时交给前端 SPA。
 app.notFound((c) => {
-  return c.text('Not Found', 404);
+  return c.env.ASSETS.fetch(c.req.raw);
 });
 
 // 全局错误处理

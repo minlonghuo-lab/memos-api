@@ -25,15 +25,6 @@ export default defineConfig([
     },
   },
   {
-    files: ['functions/**/*.js'],
-    languageOptions: {
-      globals: {
-        ...globals.browser,
-        ...globals.serviceworker,
-      },
-    },
-  },
-  {
     files: ['**/*.{js,jsx}'],
     extends: [js.configs.recommended],
     plugins: {

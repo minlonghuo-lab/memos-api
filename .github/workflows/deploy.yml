@@ -7,15 +7,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ============================================================
-  # Job 1: 部署后端 Worker
-  # ============================================================
-  deploy-backend:
-    name: Deploy Backend (Cloudflare Worker)
+  deploy:
+    name: Deploy application
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,54 +19,19 @@ jobs:
         with:
           node-version: '22'
           cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Deploy Worker
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          wranglerVersion: "latest"
-          workingDirectory: backend
-          command: deploy
-
-  # ============================================================
-  # Job 2: 构建并部署前端到 Cloudflare Pages
-  # ============================================================
-  deploy-frontend:
-    name: Deploy Frontend (Cloudflare Pages)
-    runs-on: ubuntu-latest
-    needs: deploy-backend
-    defaults:
-      run:
-        working-directory: frontend
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Install dependencies
         run: npm ci
 
       - name: Build frontend
-        run: npm run build
-        env:
-          NODE_ENV: production
+        run: npm run build:client
 
-      - name: Deploy to Cloudflare Pages
+      - name: Deploy application
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: "latest"
-          workingDirectory: frontend
-          command: pages deploy dist
+          workingDirectory: .
+          command: deploy
