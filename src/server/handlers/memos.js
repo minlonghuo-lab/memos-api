@@ -235,6 +235,7 @@ app.get('/', async (c) => {
           id: row.id,
           rowStatus: row.rowStatus,
           creatorId: row.creatorId,
+          creatorID: row.creatorId,
           createdTs: row.createdTs,
           updatedTs: row.updatedTs,
           displayTs: row.displayTs,
@@ -242,6 +243,7 @@ app.get('/', async (c) => {
           visibility: row.visibility,
           pinned: Boolean(row.pinned),
           parent: row.parent,
+          parentID: row.parent,
           creatorName: row.creatorName,
           creatorUsername: row.creatorUsername,
           creatorEmail: row.creatorEmail,
@@ -257,10 +259,11 @@ app.get('/', async (c) => {
         memo.resourceList.push({
           id: row.resourceId,
           creatorId: row.resourceCreatorId,
+          creatorID: row.resourceCreatorId,
           createdTs: row.resourceCreatedTs,
           updatedTs: row.resourceCreatedTs,
           filename: row.resourceFilename,
-          externalLink: '',  // 不设置 externalLink，让前端使用 getResourceUrl 生成代理URL
+          externalLink: `${workerUrl}/api/v1/resource/${row.resourceId}/file`,
           type: row.resourceType,
           size: row.resourceSize
         });
@@ -651,6 +654,7 @@ app.get('/all', async (c) => {
         memosMap.set(row.id, {
           id: row.id,
           creatorId: row.creator_id,
+          creatorID: row.creator_id,
           createdTs: row.created_ts,
           updatedTs: row.updated_ts,
           displayTs: row.created_ts,
@@ -678,10 +682,11 @@ app.get('/all', async (c) => {
         memo.resourceList.push({
           id: row.resourceId,
           creatorId: row.resourceCreatorId,
+          creatorID: row.resourceCreatorId,
           createdTs: row.resourceCreatedTs,
           updatedTs: row.resourceCreatedTs,
           filename: row.resourceFilename,
-          externalLink: '',  // 不设置 externalLink，让前端使用 getResourceUrl 生成代理URL
+          externalLink: `${workerUrl}/api/v1/resource/${row.resourceId}/file`,
           type: row.resourceType,
           size: row.resourceSize
         });
@@ -804,6 +809,7 @@ app.get('/:id', async (c) => {
       id: firstRow.id,
       rowStatus: firstRow.rowStatus,
       creatorId: firstRow.creatorId,
+      creatorID: firstRow.creatorId,
       createdTs: firstRow.createdTs,
       updatedTs: firstRow.updatedTs,
       displayTs: firstRow.displayTs,
@@ -811,6 +817,7 @@ app.get('/:id', async (c) => {
       visibility: firstRow.visibility,
       pinned: Boolean(firstRow.pinned),
       parent: firstRow.parent,
+      parentID: firstRow.parent,
       creatorName: firstRow.creatorName,
       creatorUsername: firstRow.creatorUsername,
       creatorEmail: firstRow.creatorEmail,
@@ -824,10 +831,11 @@ app.get('/:id', async (c) => {
         memo.resourceList.push({
           id: row.resourceId,
           creatorId: row.resourceCreatorId,
+          creatorID: row.resourceCreatorId,
           createdTs: row.resourceCreatedTs,
           updatedTs: row.resourceCreatedTs,
           filename: row.resourceFilename,
-          externalLink: '',  // 不设置 externalLink，让前端使用 getResourceUrl 生成代理URL
+          externalLink: `${new URL(c.req.url).origin}/api/v1/resource/${row.resourceId}/file`,
           type: row.resourceType,
           size: row.resourceSize
         });
@@ -1034,6 +1042,7 @@ app.post('/', async (c) => {
       id: createdMemo.id,
       rowStatus: createdMemo.rowStatus || 'NORMAL',
       creatorId: createdMemo.creatorId,
+      creatorID: createdMemo.creatorId,
       createdTs: createdMemo.createdTs,
       updatedTs: createdMemo.updatedTs,
       displayTs: createdMemo.displayTs,
@@ -1041,6 +1050,7 @@ app.post('/', async (c) => {
       visibility: createdMemo.visibility,
       pinned: Boolean(createdMemo.pinned),
       parent: createdMemo.parent,
+      parentID: createdMemo.parent,
       creatorName: createdMemo.creatorName,
       creatorUsername: createdMemo.creatorUsername,
       resourceList: resources.map(r => ({
@@ -1055,7 +1065,7 @@ app.post('/', async (c) => {
       tagList: tags.map(t => t.name)
     };
 
-    return jsonResponse(fullMemo, 201);
+    return jsonResponse(fullMemo);
   } catch (error) {
     console.error('Error creating memo:', error);
     return errorResponse('Failed to create memo', 500);
@@ -1229,6 +1239,7 @@ app.patch('/:id', async (c) => {
       id: updatedMemo.id,
       rowStatus: updatedMemo.rowStatus,
       creatorId: updatedMemo.creatorId,
+      creatorID: updatedMemo.creatorId,
       createdTs: updatedMemo.createdTs,
       updatedTs: updatedMemo.updatedTs,
       displayTs: updatedMemo.displayTs,
@@ -1236,6 +1247,7 @@ app.patch('/:id', async (c) => {
       visibility: updatedMemo.visibility,
       pinned: Boolean(updatedMemo.pinned),
       parent: updatedMemo.parent,
+      parentID: updatedMemo.parent,
       creatorName: updatedMemo.creatorName,
       creatorUsername: updatedMemo.creatorUsername,
       resourceList: resources.map(r => ({
@@ -1245,7 +1257,7 @@ app.patch('/:id', async (c) => {
         size: r.size,
         createdTs: r.createdTs,
         updatedTs: r.createdTs,
-        externalLink: ''
+        externalLink: `${new URL(c.req.url).origin}/api/v1/resource/${r.id}/file`
       })),
       tagList: tags || [],
       relationList: []

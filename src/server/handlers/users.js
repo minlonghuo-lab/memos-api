@@ -18,6 +18,45 @@ import {
 
 const app = new Hono();
 
+// MoeMemos / Memos 0.21-compatible current user endpoint.
+app.get('/me', async (c) => {
+  const authError = await requireAuth(c);
+  if (authError) return authError;
+
+  try {
+    const db = c.env.DB;
+    const currentUser = c.get('user');
+
+    const stmt = db.prepare(`
+      SELECT id, username, nickname, email, avatar_url, created_ts, updated_ts, is_admin, role, row_status
+      FROM users
+      WHERE id = ?
+    `);
+    const user = await stmt.bind(currentUser.id).first();
+
+    if (!user) {
+      return errorResponse('User not found', 404);
+    }
+
+    const role = user.role || (user.is_admin ? 'admin' : 'user');
+
+    return jsonResponse({
+      id: user.id,
+      username: user.username,
+      nickname: user.nickname,
+      email: user.email || '',
+      avatarUrl: user.avatar_url || '',
+      createdTs: user.created_ts,
+      updatedTs: user.updated_ts || user.created_ts,
+      role: role === 'host' ? 'HOST' : (role === 'admin' ? 'ADMIN' : 'USER'),
+      rowStatus: user.row_status === 1 || user.row_status === 'ARCHIVED' ? 'ARCHIVED' : 'NORMAL',
+    });
+  } catch (error) {
+    console.error('Error fetching current user:', error);
+    return errorResponse('Failed to fetch current user', 500);
+  }
+});
+
 // 获取用户列表 - 需要权限
 app.get('/', async (c) => {
   const authError = await requireAuth(c);

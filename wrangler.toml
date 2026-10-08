@@ -30,7 +30,7 @@ TIMEZONE = "Asia/Shanghai"
 [[d1_databases]]
 binding = "DB"
 database_name = "memos_db"
-database_id = "e03f026e-1974-4b76-844a-e09b4f08ae08"
+database_id = "5ee1cb8f-0f6e-46ec-9f46-c2cfaec645e1"
 
 # ========================================
 # 对象存储配置

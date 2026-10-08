@@ -449,7 +449,9 @@ export const tagServiceClient = {
     const userId = req.user?.split('/')[1];
     const path = userId ? `/api/v1/tag?userId=${userId}` : '/api/v1/tag';
     const tags = await request<any[]>('GET', path);
-    return { tags };
+    return {
+      tags: tags.map((tag) => typeof tag === 'string' ? { name: tag } : tag),
+    };
   },
 
   async upsertTag(req: { name: string }) {

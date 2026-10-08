@@ -117,7 +117,7 @@ app.get('/', async (c) => {
     const stmt = db.prepare(query);
     const { results } = await stmt.bind(...bindValues).all();
 
-    return jsonResponse(results || []);
+    return jsonResponse((results || []).map((tag) => tag.name));
   } catch (error) {
     console.error('Error fetching tags:', error);
     return errorResponse('Failed to fetch tags', 500);
@@ -152,16 +152,13 @@ app.post('/', async (c) => {
 
     const tagName = body.name.trim();
 
-    const { tag, created, conflict } = await upsertTagRecord(db, tagName, currentUser.id);
+    const { tag, conflict } = await upsertTagRecord(db, tagName, currentUser.id);
 
     if (conflict) {
       return errorResponse('Tag name already exists', 409);
     }
 
-    return jsonResponse({
-      ...tag,
-      message: created ? 'Tag created successfully' : 'Tag already exists',
-    }, created ? 201 : 200);
+    return jsonResponse(tag.name);
   } catch (error) {
     console.error('Error creating tag:', error);
     return errorResponse('Failed to create tag', 500);
