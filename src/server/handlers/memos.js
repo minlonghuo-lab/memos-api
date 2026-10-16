@@ -1,18 +1,57 @@
 import { Hono } from 'hono';
-import { requireAuth, jsonResponse, errorResponse, hashPassword, generateSecurePassword } from '../utils/auth';
+import { requireAuth, authenticateIfPresent, jsonResponse, errorResponse, hashPassword, generateSecurePassword } from '../utils/auth';
 import { simpleMD5 } from '../utils/gravatar';
 import { sendAllNotifications } from '../utils/notifications.js';
 import { attachTagToMemo, extractTagNamesFromMemoContent } from '../utils/tags.js';
+import { parsePagination } from '../utils/pagination.js';
 
 const app = new Hono();
+
+async function attachMemoMetadata(db, memos) {
+  const byId = new Map(memos.map(memo => {
+    memo.tagList = [];
+    memo.relationList = [];
+    return [memo.id, memo];
+  }));
+  // D1 has a bound-parameter limit. Batch metadata instead of issuing two
+  // queries per memo, which also exceeds free-plan query limits on full syncs.
+  for (let start = 0; start < memos.length; start += 80) {
+    const ids = memos.slice(start, start + 80).map(memo => memo.id);
+    const placeholders = ids.map(() => '?').join(',');
+    const { results: tags } = await db.prepare(`
+      SELECT mt.memo_id AS memoId, t.id, t.name FROM tags t
+      JOIN memo_tags mt ON t.id = mt.tag_id
+      WHERE mt.memo_id IN (${placeholders}) ORDER BY t.id
+    `).bind(...ids).all();
+    for (const tag of tags) byId.get(tag.memoId).tagList.push({ id: tag.id, name: tag.name });
+    const { results: relations } = await db.prepare(`
+      SELECT id, memo_id AS memoId, related_memo_id AS relatedMemoId, type, created_ts AS createdTs
+      FROM memo_relations WHERE memo_id IN (${placeholders}) ORDER BY created_ts DESC, id DESC
+    `).bind(...ids).all();
+    for (const relation of relations) byId.get(relation.memoId).relationList.push(relation);
+  }
+}
+
+async function resourceIdsForRequest(db, value, creatorId) {
+  if (!Array.isArray(value) || value.some(id => !Number.isSafeInteger(id) || id <= 0)) {
+    return null;
+  }
+  const ids = [...new Set(value)];
+  for (let start = 0; start < ids.length; start += 80) {
+    const chunk = ids.slice(start, start + 80);
+    const { results } = await db.prepare(`
+      SELECT id FROM resources WHERE creator_id = ? AND id IN (${chunk.map(() => '?').join(',')})
+    `).bind(creatorId, ...chunk).all();
+    if (results.length !== chunk.length) return null;
+  }
+  return ids;
+}
 
 // 获取memo列表
 app.get('/', async (c) => {
   try {
     const db = c.env.DB;
 
-    const limit = parseInt(c.req.query('limit')) || 20;
-    const offset = parseInt(c.req.query('offset')) || 0;
     let creatorId = c.req.query('creatorId');
     const creatorUsername = c.req.query('creatorUsername');
     const rowStatus = c.req.query('rowStatus');
@@ -24,62 +63,32 @@ app.get('/', async (c) => {
     const dateFrom = c.req.query('dateFrom') ? parseInt(c.req.query('dateFrom')) : null;
     const dateTo = c.req.query('dateTo') ? parseInt(c.req.query('dateTo')) : null;
 
+    const authError = await authenticateIfPresent(c);
+    if (authError) return authError;
+    const currentUser = c.get('user') || null;
+
     // 如果提供了 creatorUsername，转换为 creatorId
     if (creatorUsername && !creatorId) {
       const userStmt = db.prepare('SELECT id FROM users WHERE username = ?');
       const user = await userStmt.bind(creatorUsername).first();
-      if (user) {
-        creatorId = user.id.toString();
-      }
+      if (!user) return jsonResponse([]);
+      creatorId = user.id.toString();
     }
 
     // 获取 Worker URL
     const workerUrl = new URL(c.req.url).origin;
 
-    // 尝试获取当前登录用户（支持JWT和session token）
-    const token = c.req.header('Authorization')?.replace('Bearer ', '') ||
-                  c.req.header('X-Token') ||
-                  c.req.query('token');
-    let currentUser = null;
-
-    if (token) {
-      try {
-        // 优先尝试JWT验证
-        if (token.startsWith('eyJ')) {
-          const { verifyJWT, getJWTSecret } = await import('../utils/jwt.js');
-          const jwtSecret = getJWTSecret(c.env);
-          const payload = await verifyJWT(token, jwtSecret);
-
-          if (payload) {
-            // 从数据库获取最新用户信息
-            const userStmt = db.prepare(`
-              SELECT id, username, nickname, email, avatar_url, is_admin, role
-              FROM users
-              WHERE id = ?
-            `);
-            const dbUser = await userStmt.bind(payload.id).first();
-
-            if (dbUser) {
-              currentUser = {
-                id: dbUser.id,
-                username: dbUser.username,
-                nickname: dbUser.nickname,
-                email: dbUser.email || '',
-                avatarUrl: dbUser.avatar_url || '',
-                isAdmin: Boolean(dbUser.is_admin) || ['host', 'admin'].includes(dbUser.role),
-                role: dbUser.role || (dbUser.is_admin ? 'admin' : 'user')
-              };
-            }
-          }
-        } else {
-          // 回退到session token验证
-          const { validateSession } = await import('../utils/auth.js');
-          currentUser = await validateSession(db, token);
-        }
-      } catch (e) {
-        // 忽略验证错误，继续作为未登录用户
-        console.error('Token validation error:', e);
-      }
+    let limit, offset;
+    try {
+      ({ limit, offset } = parsePagination(c.req, currentUser && rowStatus ? -1 : 20));
+    } catch {
+      return errorResponse('Invalid pagination', 400);
+    }
+    if (rowStatus && !['NORMAL', 'ARCHIVED'].includes(rowStatus)) {
+      return errorResponse('Invalid rowStatus', 400);
+    }
+    if (rowStatus === 'ARCHIVED' && !currentUser) {
+      return errorResponse('Authentication required for archived memos', 401);
     }
 
     // 检查是否禁用公共备忘录
@@ -129,48 +138,26 @@ app.get('/', async (c) => {
       whereValues.push(dateTo);
     }
 
-    // 可见性处理
+    // Apply access control independently of requested visibility filters.
     if (creatorId) {
-      // 指定了 creatorId
-      if (currentUser && parseInt(creatorId) === currentUser.id) {
-        // 当前用户查看自己的memo，显示所有memo（公开+私密）
-        whereConditions.push('m.creator_id = ?');
-        whereValues.push(creatorId);
-      } else {
-        // 查看他人的memo，只显示公开的
-        whereConditions.push('m.creator_id = ?');
-        whereValues.push(creatorId);
-        if (!visibility) {
-          whereConditions.push('m.visibility = ?');
-          whereValues.push('PUBLIC');
-        } else {
-          whereConditions.push('m.visibility = ?');
-          whereValues.push(visibility);
-        }
-      }
+      whereConditions.push('m.creator_id = ?');
+      whereValues.push(creatorId);
+    } else if (currentUser && rowStatus && c.req.query('limit') === undefined) {
+      // Unpaginated personal sync defaults to this account. Explicit Web pages
+      // keep their existing feed behavior; Explore also has /all.
+      whereConditions.push('m.creator_id = ?');
+      whereValues.push(currentUser.id);
+    }
+    if (currentUser) {
+      whereConditions.push('(m.creator_id = ? OR (m.row_status = ? AND m.visibility IN (?, ?)))');
+      whereValues.push(currentUser.id, 'NORMAL', 'PUBLIC', 'PROTECTED');
     } else {
-      // 没有指定 creatorId
-      if (currentUser) {
-        // 已登录用户
-        // 特殊处理：如果查询的是 ARCHIVED 状态，只返回当前用户自己的归档
-        if (rowStatus === 'ARCHIVED') {
-          whereConditions.push('m.creator_id = ?');
-          whereValues.push(currentUser.id);
-        } else {
-          // 正常状态：显示自己的所有memo + 他人的公开memo
-          whereConditions.push('(m.creator_id = ? OR m.visibility = ?)');
-          whereValues.push(currentUser.id, 'PUBLIC');
-        }
-      } else {
-        // 未登录用户：只显示公开memo
-        if (!visibility) {
-          whereConditions.push('m.visibility = ?');
-          whereValues.push('PUBLIC');
-        } else {
-          whereConditions.push('m.visibility = ?');
-          whereValues.push(visibility);
-        }
-      }
+      whereConditions.push('m.visibility = ?');
+      whereValues.push('PUBLIC');
+    }
+    if (visibility) {
+      whereConditions.push('m.visibility = ?');
+      whereValues.push(visibility);
     }
 
     const whereClause = whereConditions.length > 0 ? 'WHERE ' + whereConditions.join(' AND ') : '';
@@ -191,6 +178,13 @@ app.get('/', async (c) => {
       : '';
 
     const stmt = db.prepare(`
+      WITH selected_memos AS (
+        SELECT ${needsTagJoin ? 'DISTINCT' : ''} m.* FROM memos m
+        ${tagJoinClause}
+        ${whereClause}
+        ORDER BY m.pinned DESC, ${sortField} DESC, m.id DESC
+        LIMIT ? OFFSET ?
+      )
       SELECT ${needsTagJoin ? 'DISTINCT' : ''}
         m.id,
         m.row_status as rowStatus,
@@ -212,18 +206,15 @@ app.get('/', async (c) => {
         r.type as resourceType,
         r.size as resourceSize,
         r.created_ts as resourceCreatedTs
-      FROM memos m
+      FROM selected_memos m
       LEFT JOIN users u ON m.creator_id = u.id
       LEFT JOIN memo_resources mr ON m.id = mr.memo_id
       LEFT JOIN resources r ON mr.resource_id = r.id
-      ${tagJoinClause}
-      ${whereClause}
-      ORDER BY m.pinned DESC, ${sortField} DESC
-      LIMIT ? OFFSET ?
+      ORDER BY m.pinned DESC, ${sortField} DESC, m.id DESC, r.id ASC
     `);
 
     // 绑定参数
-    const bindValues = [...whereValues, limit * 10, offset]; // 扩大查询范围以获取足够的资源
+    const bindValues = [...whereValues, limit, offset];
     const { results: rawResults } = await stmt.bind(...bindValues).all();
 
     // 合并结果,将资源组合到对应的 memo 中
@@ -271,35 +262,9 @@ app.get('/', async (c) => {
     }
 
     // 转换为数组并限制数量
-    const results = Array.from(memosMap.values()).slice(0, limit);
+    const results = Array.from(memosMap.values());
 
-    // 获取每个memo的标签和关系
-    for (const memo of results) {
-      // 获取标签
-      const tagStmt = db.prepare(`
-        SELECT t.id, t.name
-        FROM tags t
-        JOIN memo_tags mt ON t.id = mt.tag_id
-        WHERE mt.memo_id = ?
-      `);
-      const { results: tags } = await tagStmt.bind(memo.id).all();
-      memo.tagList = tags || [];
-
-      // 获取关系（评论和引用）
-      const relationStmt = db.prepare(`
-        SELECT
-          mr.id,
-          mr.memo_id as memoId,
-          mr.related_memo_id as relatedMemoId,
-          mr.type,
-          mr.created_ts as createdTs
-        FROM memo_relations mr
-        WHERE mr.memo_id = ?
-        ORDER BY mr.created_ts DESC
-      `);
-      const { results: relations } = await relationStmt.bind(memo.id).all();
-      memo.relationList = relations || [];
-    }
+    await attachMemoMetadata(db, results);
 
     // 隐藏邮箱地址保护隐私，但保留emailHash用于头像
     for (const memo of results) {
@@ -310,16 +275,6 @@ app.get('/', async (c) => {
       }
       delete memo.creatorEmail;
     }
-
-    // 获取总数用于分页
-    const countStmt = db.prepare(`
-      SELECT COUNT(DISTINCT m.id) as total
-      FROM memos m
-      ${tagJoinClause}
-      ${whereClause}
-    `);
-    const countResult = await countStmt.bind(...whereValues).first();
-    const total = countResult?.total || 0;
 
     // 直接返回数组，不包装在 data 中
     return jsonResponse(results);
@@ -530,54 +485,20 @@ app.get('/all', async (c) => {
   try {
     const db = c.env.DB;
 
-    const limit = parseInt(c.req.query('limit')) || 20;
-    const offset = parseInt(c.req.query('offset')) || 0;
+    let limit, offset;
+    try {
+      ({ limit, offset } = parsePagination(c.req));
+    } catch {
+      return errorResponse('Invalid pagination', 400);
+    }
     const creatorUsername = c.req.query('creatorUsername');
 
     // 获取 Worker URL
     const workerUrl = new URL(c.req.url).origin;
 
-    // 检查用户是否已登录
-    const token = c.req.header('Authorization')?.replace('Bearer ', '') ||
-                  c.req.header('X-Token') ||
-                  c.req.query('token');
-    let currentUser = null;
-    if (token) {
-      try {
-        if (token.startsWith('eyJ')) {
-          const { verifyJWT, getJWTSecret } = await import('../utils/jwt.js');
-          const jwtSecret = getJWTSecret(c.env);
-          const payload = await verifyJWT(token, jwtSecret);
-
-          if (payload) {
-            const userStmt = db.prepare(`
-              SELECT id, username, nickname, email, avatar_url, is_admin, role
-              FROM users
-              WHERE id = ?
-            `);
-            const dbUser = await userStmt.bind(payload.id).first();
-
-            if (dbUser) {
-              currentUser = {
-                id: dbUser.id,
-                username: dbUser.username,
-                nickname: dbUser.nickname,
-                email: dbUser.email || '',
-                avatarUrl: dbUser.avatar_url || '',
-                isAdmin: Boolean(dbUser.is_admin) || ['host', 'admin'].includes(dbUser.role),
-                role: dbUser.role || (dbUser.is_admin ? 'admin' : 'user')
-              };
-            }
-          }
-        } else {
-          const { validateSession } = await import('../utils/auth.js');
-          currentUser = await validateSession(c.env.DB, token);
-        }
-      } catch (e) {
-        // 忽略验证错误，继续作为未登录用户
-        console.error('Token validation error:', e);
-      }
-    }
+    const authError = await authenticateIfPresent(c);
+    if (authError) return authError;
+    const currentUser = c.get('user') || null;
 
     // 检查是否禁用公共备忘录
     const disablePublicMemosStmt = db.prepare("SELECT value FROM settings WHERE key = 'disable-public-memos'");
@@ -590,8 +511,8 @@ app.get('/all', async (c) => {
     }
 
     // 构建动态查询条件
-    let whereConditions = ['m.row_status = ?', 'm.visibility != ?'];
-    let whereValues = ['NORMAL', 'PRIVATE'];
+    let whereConditions = ['m.row_status = ?', currentUser ? 'm.visibility IN (?, ?)' : 'm.visibility = ?'];
+    let whereValues = currentUser ? ['NORMAL', 'PUBLIC', 'PROTECTED'] : ['NORMAL', 'PUBLIC'];
 
     // 按创建者用户名筛选
     if (creatorUsername) {
@@ -611,6 +532,13 @@ app.get('/all', async (c) => {
 
     // 使用 LEFT JOIN 查询 memos 和资源
     const stmt = db.prepare(`
+      WITH selected_memos AS (
+        SELECT m.* FROM memos m
+        LEFT JOIN users u ON m.creator_id = u.id
+        WHERE ${whereClause}
+        ORDER BY ${sortField} DESC, m.id DESC
+        LIMIT ? OFFSET ?
+      )
       SELECT
         m.id,
         m.creator_id,
@@ -631,16 +559,14 @@ app.get('/all', async (c) => {
         r.type as resourceType,
         r.size as resourceSize,
         r.created_ts as resourceCreatedTs
-      FROM memos m
+      FROM selected_memos m
       LEFT JOIN users u ON m.creator_id = u.id
       LEFT JOIN memo_resources mr ON m.id = mr.memo_id
       LEFT JOIN resources r ON mr.resource_id = r.id
-      WHERE ${whereClause}
-      ORDER BY ${sortField} DESC
-      LIMIT ? OFFSET ?
+      ORDER BY ${sortField} DESC, m.id DESC, r.id ASC
     `);
 
-    const { results: rawResults } = await stmt.bind(...whereValues, limit * 10, offset).all();
+    const { results: rawResults } = await stmt.bind(...whereValues, limit, offset).all();
 
     // 合并结果，将资源组合到对应的 memo 中
     const memosMap = new Map();
@@ -694,7 +620,7 @@ app.get('/all', async (c) => {
     }
 
     // 转换为数组并限制数量
-    const memos = Array.from(memosMap.values()).slice(0, limit);
+    const memos = Array.from(memosMap.values());
 
     return c.json(memos);
   } catch (error) {
@@ -704,10 +630,9 @@ app.get('/all', async (c) => {
 });
 
 // 获取单个memo详情
-app.get('/:id', async (c) => {
+async function getMemo(c, id = c.req.param('id'), alreadyAuthorized = false) {
   try {
     const db = c.env.DB;
-    const id = c.req.param('id');
 
     // 使用 LEFT JOIN 一次性获取 memo 和所有资源
     const stmt = db.prepare(`
@@ -736,7 +661,7 @@ app.get('/:id', async (c) => {
       LEFT JOIN users u ON m.creator_id = u.id
       LEFT JOIN memo_resources mr ON m.id = mr.memo_id
       LEFT JOIN resources r ON mr.resource_id = r.id
-      WHERE m.id = ? AND m.row_status = 'NORMAL'
+      WHERE m.id = ?
     `);
 
     const { results: rawResults } = await stmt.bind(id).all();
@@ -748,47 +673,9 @@ app.get('/:id', async (c) => {
     // 构建 memo 对象
     const firstRow = rawResults[0];
 
-    // 检查用户是否已登录
-    const token = c.req.header('Authorization')?.replace('Bearer ', '') ||
-                  c.req.header('X-Token') ||
-                  c.req.query('token');
-    let currentUser = null;
-    if (token) {
-      try {
-        if (token.startsWith('eyJ')) {
-          const { verifyJWT, getJWTSecret } = await import('../utils/jwt.js');
-          const jwtSecret = getJWTSecret(c.env);
-          const payload = await verifyJWT(token, jwtSecret);
-
-          if (payload) {
-            const userStmt = db.prepare(`
-              SELECT id, username, nickname, email, avatar_url, is_admin, role
-              FROM users
-              WHERE id = ?
-            `);
-            const dbUser = await userStmt.bind(payload.id).first();
-
-            if (dbUser) {
-              currentUser = {
-                id: dbUser.id,
-                username: dbUser.username,
-                nickname: dbUser.nickname,
-                email: dbUser.email || '',
-                avatarUrl: dbUser.avatar_url || '',
-                isAdmin: Boolean(dbUser.is_admin) || ['host', 'admin'].includes(dbUser.role),
-                role: dbUser.role || (dbUser.is_admin ? 'admin' : 'user')
-              };
-            }
-          }
-        } else {
-          const { validateSession } = await import('../utils/auth.js');
-          currentUser = await validateSession(c.env.DB, token);
-        }
-      } catch (e) {
-        // 忽略验证错误，继续作为未登录用户
-        console.error('Token validation error:', e);
-      }
-    }
+    const authError = await authenticateIfPresent(c);
+    if (authError) return authError;
+    const currentUser = c.get('user') || null;
 
     // 检查是否禁用公共备忘录
     const disablePublicMemosStmt = db.prepare("SELECT value FROM settings WHERE key = 'disable-public-memos'");
@@ -800,8 +687,15 @@ app.get('/:id', async (c) => {
       return errorResponse('Access denied. Please login to view memos.', 403);
     }
 
+    if (!alreadyAuthorized && firstRow.rowStatus === 'ARCHIVED' && (!currentUser || currentUser.id !== firstRow.creatorId)) {
+      return errorResponse('Memo not found', 404);
+    }
+    if (!alreadyAuthorized && firstRow.visibility === 'PROTECTED' && !currentUser) {
+      return errorResponse('Authentication required', 401);
+    }
+
     // 如果 memo 是私密的，只有创建者可以查看
-    if (firstRow.visibility === 'PRIVATE' && (!currentUser || currentUser.id !== firstRow.creatorId)) {
+    if (!alreadyAuthorized && firstRow.visibility === 'PRIVATE' && (!currentUser || currentUser.id !== firstRow.creatorId)) {
       return errorResponse('Access denied. This memo is private.', 403);
     }
 
@@ -875,7 +769,9 @@ app.get('/:id', async (c) => {
     console.error('Error fetching memo:', error);
     return errorResponse('Failed to fetch memo', 500);
   }
-});
+}
+
+app.get('/:id', c => getMemo(c));
 
 // 创建memo - 需要权限
 app.post('/', async (c) => {
@@ -885,9 +781,6 @@ app.post('/', async (c) => {
   try {
     const db = c.env.DB;
     const body = await c.req.json();
-
-    // 获取 Worker URL
-    const workerUrl = new URL(c.req.url).origin;
 
     // 允许内容为空，但至少要有内容或资源
     if (!body.content && (!body.resourceIdList || body.resourceIdList.length === 0)) {
@@ -926,20 +819,29 @@ app.post('/', async (c) => {
       }
     }
 
+    const resourceIds = await resourceIdsForRequest(db, body.resourceIdList ?? [], creatorId);
+    if (resourceIds === null) return errorResponse('Invalid or inaccessible resourceIdList', 400);
+    const now = Math.floor(Date.now() / 1000);
+    const createdTs = body.createdTs ?? now;
+    if (!Number.isSafeInteger(createdTs) || createdTs < 0) {
+      return errorResponse('Invalid createdTs', 400);
+    }
+
     // 提取并保存标签（但保留在内容中）
     const tagNames = extractTagNamesFromMemoContent(body.content);
 
     const stmt = db.prepare(`
-      INSERT INTO memos (creator_id, content, visibility, display_ts)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO memos (creator_id, content, visibility, created_ts, updated_ts, display_ts)
+      VALUES (?, ?, ?, ?, ?, ?)
     `);
 
-    const now = Math.floor(Date.now() / 1000);
     const result = await stmt.bind(
       creatorId,
       body.content || '', // 保留原始内容，包括 tag
       body.visibility || 'PUBLIC',
-      now
+      createdTs,
+      now,
+      createdTs
     ).run();
 
     const memoId = result.meta.last_row_id;
@@ -949,16 +851,10 @@ app.post('/', async (c) => {
       await attachTagToMemo(db, memoId, tagName, creatorId);
     }
 
-    // 处理资源列表
-    if (body.resourceIdList && Array.isArray(body.resourceIdList)) {
-      for (const resourceId of body.resourceIdList) {
-        // 直接关联已上传的资源
-        const linkStmt = db.prepare(`
-          INSERT INTO memo_resources (memo_id, resource_id)
-          VALUES (?, ?)
-        `);
-        await linkStmt.bind(memoId, resourceId).run();
-      }
+    if (resourceIds.length) {
+      await db.batch(resourceIds.map(resourceId => db.prepare(
+        'INSERT INTO memo_resources (memo_id, resource_id) VALUES (?, ?)'
+      ).bind(memoId, resourceId)));
     }
 
     // 获取创建者信息用于通知
@@ -975,7 +871,7 @@ app.post('/', async (c) => {
       creatorName: creator?.nickname || creator?.username || 'unknown',
       createdTs: now,
       tags: tagNames,
-      resourceCount: body.resourceIdList?.length || 0,
+      resourceCount: resourceIds.length,
     };
 
     console.log('📝 Memo created, preparing to send notifications:', {
@@ -992,80 +888,7 @@ app.post('/', async (c) => {
       })
     );
 
-    // 查询并返回完整的memo对象
-    const memoStmt = db.prepare(`
-      SELECT
-        m.id,
-        m.row_status as rowStatus,
-        m.creator_id as creatorId,
-        m.created_ts as createdTs,
-        m.updated_ts as updatedTs,
-        m.display_ts as displayTs,
-        m.content,
-        m.visibility,
-        m.pinned,
-        m.parent_id as parent,
-        u.nickname as creatorName,
-        u.username as creatorUsername,
-        u.email as creatorEmail
-      FROM memos m
-      LEFT JOIN users u ON m.creator_id = u.id
-      WHERE m.id = ?
-    `);
-
-    const createdMemo = await memoStmt.bind(memoId).first();
-
-    if (!createdMemo) {
-      return errorResponse('Failed to retrieve created memo', 500);
-    }
-
-    // 获取关联的资源
-    const resourcesStmt = db.prepare(`
-      SELECT r.id, r.filename, r.filepath, r.type, r.size, r.created_ts
-      FROM resources r
-      INNER JOIN memo_resources mr ON r.id = mr.resource_id
-      WHERE mr.memo_id = ?
-    `);
-    const { results: resources } = await resourcesStmt.bind(memoId).all();
-
-    // 获取关联的标签
-    const tagsStmt = db.prepare(`
-      SELECT t.name
-      FROM tags t
-      INNER JOIN memo_tags mt ON t.id = mt.tag_id
-      WHERE mt.memo_id = ?
-    `);
-    const { results: tags } = await tagsStmt.bind(memoId).all();
-
-    // 组装完整的memo对象
-    const fullMemo = {
-      id: createdMemo.id,
-      rowStatus: createdMemo.rowStatus || 'NORMAL',
-      creatorId: createdMemo.creatorId,
-      creatorID: createdMemo.creatorId,
-      createdTs: createdMemo.createdTs,
-      updatedTs: createdMemo.updatedTs,
-      displayTs: createdMemo.displayTs,
-      content: createdMemo.content,
-      visibility: createdMemo.visibility,
-      pinned: Boolean(createdMemo.pinned),
-      parent: createdMemo.parent,
-      parentID: createdMemo.parent,
-      creatorName: createdMemo.creatorName,
-      creatorUsername: createdMemo.creatorUsername,
-      resourceList: resources.map(r => ({
-        id: r.id,
-        filename: r.filename,
-        externalLink: r.filepath.startsWith('http') ? r.filepath : `${workerUrl}/o/r/${r.id}/${r.filename}`,
-        type: r.type,
-        size: r.size,
-        createdTs: r.created_ts
-      })),
-      relationList: [],
-      tagList: tags.map(t => t.name)
-    };
-
-    return jsonResponse(fullMemo);
+    return getMemo(c, memoId, true);
   } catch (error) {
     console.error('Error creating memo:', error);
     return errorResponse('Failed to create memo', 500);
@@ -1083,7 +906,7 @@ app.patch('/:id', async (c) => {
     const body = await c.req.json();
 
     // 检查是否至少提供了一个字段
-    if (!body.content && !body.rowStatus && body.visibility === undefined && body.pinned === undefined) {
+    if (['content', 'rowStatus', 'visibility', 'pinned', 'resourceIdList', 'deleteResourceIds', 'updatedTs', 'createdTs'].every(key => body[key] === undefined)) {
       return errorResponse('At least one field is required for update', 400);
     }
 
@@ -1109,9 +932,23 @@ app.patch('/:id', async (c) => {
       return errorResponse('Permission denied: You can only edit your own memos', 403);
     }
 
+    const resourceIds = body.resourceIdList === undefined ? undefined :
+      await resourceIdsForRequest(db, body.resourceIdList, memo.creator_id);
+    if (resourceIds === null) return errorResponse('Invalid or inaccessible resourceIdList', 400);
+    for (const key of ['createdTs', 'updatedTs']) {
+      if (body[key] !== undefined && (!Number.isSafeInteger(body[key]) || body[key] < 0)) {
+        return errorResponse(`Invalid ${key}`, 400);
+      }
+    }
+
     // 构建更新字段
     const updateFields = ['updated_ts = ?'];
-    const updateValues = [Math.floor(Date.now() / 1000)];
+    const updateValues = [body.updatedTs ?? Math.floor(Date.now() / 1000)];
+
+    if (body.createdTs !== undefined) {
+      updateFields.push('created_ts = ?', 'display_ts = ?');
+      updateValues.push(body.createdTs, body.createdTs);
+    }
 
     // 可选字段：内容
     if (body.content !== undefined) {
@@ -1174,96 +1011,17 @@ app.patch('/:id', async (c) => {
       }
     }
 
-    // 处理附件：添加新附件
-    if (body.resourceIdList && Array.isArray(body.resourceIdList)) {
-      for (const resourceId of body.resourceIdList) {
-        // 检查是否已经关联，避免重复
-        const checkStmt = db.prepare(`
-          SELECT COUNT(*) as count
-          FROM memo_resources
-          WHERE memo_id = ? AND resource_id = ?
-        `);
-        const existing = await checkStmt.bind(id, resourceId).first();
-
-        if (existing.count === 0) {
-          const linkStmt = db.prepare(`
-            INSERT INTO memo_resources (memo_id, resource_id)
-            VALUES (?, ?)`);
-          await linkStmt.bind(id, resourceId).run();
-        }
-      }
+    // Memos 0.21 sends the complete attachment set, including [] for removal.
+    if (resourceIds !== undefined) {
+      await db.batch([
+        db.prepare('DELETE FROM memo_resources WHERE memo_id = ?').bind(id),
+        ...resourceIds.map(resourceId => db.prepare(
+          'INSERT INTO memo_resources (memo_id, resource_id) VALUES (?, ?)'
+        ).bind(id, resourceId)),
+      ]);
     }
 
-    // 重新查询更新后的完整 memo 数据
-    const getMemoStmt = db.prepare(`
-      SELECT
-        m.id,
-        m.row_status as rowStatus,
-        m.creator_id as creatorId,
-        m.created_ts as createdTs,
-        m.updated_ts as updatedTs,
-        m.display_ts as displayTs,
-        m.content,
-        m.visibility,
-        m.pinned,
-        m.parent_id as parent,
-        u.nickname as creatorName,
-        u.username as creatorUsername
-      FROM memos m
-      LEFT JOIN users u ON m.creator_id = u.id
-      WHERE m.id = ?
-    `);
-
-    const updatedMemo = await getMemoStmt.bind(id).first();
-
-    // 获取资源列表
-    const resourceStmt = db.prepare(`
-      SELECT r.id, r.filename, r.type, r.size, r.created_ts as createdTs
-      FROM resources r
-      JOIN memo_resources mr ON r.id = mr.resource_id
-      WHERE mr.memo_id = ?
-    `);
-    const { results: resources } = await resourceStmt.bind(id).all();
-
-    // 获取标签列表
-    const tagStmt = db.prepare(`
-      SELECT t.id, t.name
-      FROM tags t
-      JOIN memo_tags mt ON t.id = mt.tag_id
-      WHERE mt.memo_id = ?
-    `);
-    const { results: tags } = await tagStmt.bind(id).all();
-
-    // 组装完整的 memo 对象
-    const fullMemo = {
-      id: updatedMemo.id,
-      rowStatus: updatedMemo.rowStatus,
-      creatorId: updatedMemo.creatorId,
-      creatorID: updatedMemo.creatorId,
-      createdTs: updatedMemo.createdTs,
-      updatedTs: updatedMemo.updatedTs,
-      displayTs: updatedMemo.displayTs,
-      content: updatedMemo.content,
-      visibility: updatedMemo.visibility,
-      pinned: Boolean(updatedMemo.pinned),
-      parent: updatedMemo.parent,
-      parentID: updatedMemo.parent,
-      creatorName: updatedMemo.creatorName,
-      creatorUsername: updatedMemo.creatorUsername,
-      resourceList: resources.map(r => ({
-        id: r.id,
-        filename: r.filename,
-        type: r.type,
-        size: r.size,
-        createdTs: r.createdTs,
-        updatedTs: r.createdTs,
-        externalLink: `${new URL(c.req.url).origin}/api/v1/resource/${r.id}/file`
-      })),
-      tagList: tags || [],
-      relationList: []
-    };
-
-    return jsonResponse(fullMemo);
+    return getMemo(c, id, true);
   } catch (error) {
     console.error('Error updating memo:', error);
     return errorResponse('Failed to update memo', 500);
@@ -1542,11 +1300,7 @@ app.post('/:id/organizer', async (c) => {
       return errorResponse('Failed to update memo organizer', 500);
     }
 
-    return jsonResponse({
-      id: parseInt(id),
-      pinned: Boolean(body.pinned),
-      message: body.pinned ? 'Memo pinned successfully' : 'Memo unpinned successfully'
-    });
+    return getMemo(c, id, true);
   } catch (error) {
     console.error('Error updating memo organizer:', error);
     return errorResponse('Failed to update memo organizer', 500);

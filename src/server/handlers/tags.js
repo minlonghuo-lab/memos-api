@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { requireAuth, jsonResponse, errorResponse } from '../utils/auth';
+import { requireAuth, authenticateIfPresent, jsonResponse, errorResponse } from '../utils/auth';
 import { getTagSchema, upsertTagRecord } from '../utils/tags.js';
 
 const app = new Hono();
@@ -9,35 +9,9 @@ const app = new Hono();
  * 参考 Memos: GET /api/v1/tag
  */
 app.get('/', async (c) => {
-  // 获取当前用户（如果已登录）
-  const token = c.req.header('Authorization')?.replace('Bearer ', '') ||
-                c.req.header('X-Token') ||
-                c.req.query('token');
-  let currentUser = null;
-
-  if (token) {
-    try {
-      // 优先尝试JWT验证
-      if (token.startsWith('eyJ')) {
-        const { verifyJWT, getJWTSecret } = await import('../utils/jwt.js');
-        const jwtSecret = getJWTSecret(c.env);
-        const payload = await verifyJWT(token, jwtSecret);
-
-        if (payload) {
-          currentUser = { id: payload.id };
-        }
-      } else {
-        // 回退到session token验证
-        const { validateSession } = await import('../utils/auth.js');
-        const sessionUser = await validateSession(c.env.DB, token);
-        if (sessionUser) {
-          currentUser = { id: sessionUser.id };
-        }
-      }
-    } catch (e) {
-      // 忽略验证错误，继续作为未登录用户
-    }
-  }
+  const authError = await authenticateIfPresent(c);
+  if (authError) return authError;
+  const currentUser = c.get('user') || null;
 
   try {
     const db = c.env.DB;

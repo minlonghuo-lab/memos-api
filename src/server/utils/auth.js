@@ -248,6 +248,14 @@ export async function ensureDefaultUser(db) {
   }
 }
 
+// Public endpoints may omit credentials. Supplied credentials must still be
+// validated exactly as they are for writes; a public subset is not a sync snapshot.
+export async function authenticateIfPresent(c) {
+  const token = c.req.header('Authorization')?.replace('Bearer ', '') ||
+    c.req.header('X-Token') || c.req.query('token');
+  return token ? requireAuth(c) : null;
+}
+
 // TOKEN认证中间件
 export async function requireAuth(c) {
   // 支持 Hono Context 对象和传统 Request 对象
