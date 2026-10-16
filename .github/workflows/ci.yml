@@ -25,6 +25,7 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
       - run: npm ci
+      - run: npm test
       - run: npm run build
         env:
           WRANGLER_SEND_METRICS: 'false'

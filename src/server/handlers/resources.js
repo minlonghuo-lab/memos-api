@@ -1,3 +1,4 @@
+import { parsePagination } from '../utils/pagination.js';
 import { Hono } from 'hono';
 import { requireAuth, jsonResponse, errorResponse, ensureDefaultUser } from '../utils/auth';
 
@@ -128,8 +129,12 @@ app.get('/', async (c) => {
   try {
     const db = c.env.DB;
     const currentUser = c.get('user');
-    const limit = parseInt(c.req.query('limit')) || 20;
-    const offset = parseInt(c.req.query('offset')) || 0;
+    let limit, offset;
+    try {
+      ({ limit, offset } = parsePagination(c.req, -1));
+    } catch {
+      return errorResponse('Invalid pagination', 400);
+    }
 
     // 只返回当前用户创建的资源
     // 使用子查询获取第一个关联的 memo_id（只返回状态为 NORMAL 的 memo）
@@ -147,7 +152,7 @@ app.get('/', async (c) => {
       FROM resources r
       LEFT JOIN users u ON r.creator_id = u.id
       WHERE r.creator_id = ?
-      ORDER BY r.created_ts DESC
+      ORDER BY r.created_ts DESC, r.id DESC
       LIMIT ? OFFSET ?
     `);
 
