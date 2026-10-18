@@ -13,8 +13,16 @@ import accessTokensApp from './handlers/accessTokens';
 import webhooksApp from './handlers/webhooks';
 import identityProvidersApp from './handlers/identityProviders';
 import telegramApp from './handlers/telegram';
+import { affectsPublicFeed, notifyPublicFeed } from './utils/publicFeed.js';
 
 const app = new Hono();
+
+app.use('/api/v1/*', async (c, next) => {
+  await next();
+  if (affectsPublicFeed(c.req.path, c.req.method, c.res.status)) {
+    c.executionCtx.waitUntil(notifyPublicFeed(c.env));
+  }
+});
 
 app.use('/*', cors({
   origin: (origin) => {
