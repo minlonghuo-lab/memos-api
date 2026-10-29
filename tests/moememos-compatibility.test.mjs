@@ -40,6 +40,32 @@ before(async () => {
 });
 after(async () => { await mf?.dispose(); });
 
+test('MoeMemos multipart attachments retain unique bytes, Unicode names, ranges and memo associations', async () => {
+  const upload = async text => {
+    const form = new FormData(); form.set('file', new Blob([text], { type: 'application/octet-stream' }), '项目资料.pdf');
+    const encoded = new Request('http://localhost/api/v1/resource/blob', { method: 'POST', headers: { Authorization: `Bearer ${jwt}` }, body: form });
+    const response = await mf.dispatchFetch(encoded.url, { method: 'POST', headers: encoded.headers, body: await encoded.arrayBuffer() });
+    assert.equal(response.status, 200); return response.json();
+  };
+  const [a, b] = await Promise.all([upload('first PDF'), upload('second PDF')]);
+  assert.notEqual(a.filepath, b.filepath);
+  assert.equal(a.filename, '项目资料.pdf'); assert.equal(a.type, 'application/pdf');
+  const url = `http://localhost/api/v1/resource/${a.id}/file`;
+  assert.equal(await (await mf.dispatchFetch(url)).text(), 'first PDF');
+  const range = await mf.dispatchFetch(url, { headers: { Range: 'bytes=1-3' } });
+  assert.equal(range.status, 206); assert.equal(await range.text(), 'irs');
+  assert.equal(range.headers.get('content-range'), 'bytes 1-3/9');
+  assert.match(range.headers.get('content-disposition'), /filename\*=UTF-8''%E9/);
+  const head = await mf.dispatchFetch(url, { method: 'HEAD' });
+  assert.equal(head.headers.get('content-length'), '9'); assert.equal(await head.text(), '');
+  assert.equal((await mf.dispatchFetch(url, { headers: { Range: 'bytes=999-' } })).status, 416);
+  const created = await json('memo', { method: 'POST', body: { content: '', visibility: 'PUBLIC', resourceIdList: [a.id, b.id] } });
+  assert.deepEqual(created.resourceList.map(r => r.id), [a.id, b.id]);
+  await json(`memo/${created.id}`, { method: 'DELETE' });
+  await json(`resource/${a.id}`, { method: 'DELETE' }); await json(`resource/${b.id}`, { method: 'DELETE' });
+  await db.prepare('DELETE FROM memos WHERE id = ?').bind(created.id).run();
+});
+
 async function request(path, { token = jwt, method = 'GET', body } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;

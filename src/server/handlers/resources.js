@@ -1,6 +1,7 @@
 import { parsePagination } from '../utils/pagination.js';
 import { Hono } from 'hono';
 import { requireAuth, jsonResponse, errorResponse, ensureDefaultUser } from '../utils/auth';
+import { byteRange, contentDisposition, effectiveFileType } from '../utils/resourceFiles.js';
 
 const app = new Hono();
 
@@ -13,7 +14,7 @@ const formatResource = (resource, origin) => ({
   filename: resource.filename,
   filepath: resource.filepath,
   externalLink: resource.filepath?.startsWith('http') ? resource.filepath : resourceFileUrl(origin, resource),
-  type: resource.type,
+  type: effectiveFileType(resource.filename, resource.type),
   size: resource.size,
   createdTs: resource.created_ts ?? resource.createdTs,
   updatedTs: resource.updated_ts ?? resource.updatedTs ?? resource.created_ts ?? resource.createdTs,
@@ -59,12 +60,17 @@ async function createResourceFromUpload(c) {
       }, new URL(c.req.url).origin));
     }
 
+    if (typeof file === 'string' || typeof file.stream !== 'function' || typeof file.name !== 'string') {
+      return errorResponse('Invalid file', 400);
+    }
+
     const MAX_FILE_SIZE = 32 * 1024 * 1024;
     if (file.size > MAX_FILE_SIZE) {
       return errorResponse(`File size exceeds maximum allowed size of ${MAX_FILE_SIZE / 1024 / 1024}MB`);
     }
 
     const filename = file.name;
+    const type = effectiveFileType(filename, file.type);
     if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
       return errorResponse('Invalid filename');
     }
@@ -74,13 +80,13 @@ async function createResourceFromUpload(c) {
       creatorId = await ensureDefaultUser(c.env.DB);
     }
 
-    const timestamp = Date.now();
-    const fileExtension = file.name.split('.').pop();
-    const uniqueFilename = `${creatorId}_${timestamp}.${fileExtension}`;
+    const fileExtension = file.name.match(/\.([a-z0-9]{1,12})$/i)?.[1]?.toLowerCase();
+    // MoeMemos can upload multiple same-type files in parallel in one millisecond.
+    const uniqueFilename = `${creatorId}_${crypto.randomUUID()}${fileExtension ? `.${fileExtension}` : ''}`;
 
     const uploadResult = await bucket.put(uniqueFilename, file.stream(), {
       httpMetadata: {
-        contentType: file.type || 'application/octet-stream',
+        contentType: type,
       },
     });
 
@@ -97,7 +103,7 @@ async function createResourceFromUpload(c) {
       creatorId,
       file.name,
       uniqueFilename,
-      file.type || 'application/octet-stream',
+      type,
       file.size
     ).run();
 
@@ -106,7 +112,7 @@ async function createResourceFromUpload(c) {
       creator_id: creatorId,
       filename: file.name,
       filepath: uniqueFilename,
-      type: file.type || 'application/octet-stream',
+      type,
       size: file.size,
       created_ts: Math.floor(Date.now() / 1000),
     };
@@ -179,7 +185,7 @@ app.get('/', async (c) => {
 app.post('/blob', createResourceFromUpload);
 
 // 文件代理路由 - 直接从 R2 读取并返回
-app.get('/:id/file', async (c) => {
+app.on(['GET', 'HEAD'], '/:id/file', async (c) => {
   try {
     const db = c.env.DB;
     const bucket = c.env.BUCKET;
@@ -197,17 +203,33 @@ app.get('/:id/file', async (c) => {
       return errorResponse('Resource not found', 404);
     }
 
+    resource.type = effectiveFileType(resource.filename, resource.type);
+
     // 从 filepath 中提取 R2 对象的 key（文件名）
     let objectKey = resource.filepath;
 
-    // 如果 filepath 是完整 URL，提取文件名部分
+    // External resources keep their original URL rather than looking up an R2 key.
     if (objectKey.startsWith('http')) {
       const url = new URL(objectKey);
-      objectKey = url.pathname.substring(1); // 移除开头的 /
+      if (!['http:', 'https:'].includes(url.protocol)) return errorResponse('Invalid resource URL', 400);
+      return Response.redirect(url.href, 302);
     }
 
-    // 从 R2 获取文件
-    const object = await bucket.get(objectKey);
+    const rangeHeader = c.req.header('Range');
+    let range = null;
+    if (rangeHeader || c.req.method === 'HEAD') {
+      const metadata = await bucket.head(objectKey);
+      if (!metadata) return errorResponse('File not found in storage', 404);
+      range = byteRange(c.req.header('If-Range') && c.req.header('If-Range') !== metadata.httpEtag ? null : rangeHeader, metadata.size);
+      if (range === false) return new Response(null, { status: 416,
+        headers: { 'Content-Range': `bytes */${metadata.size}`, 'Accept-Ranges': 'bytes' } });
+      if (c.req.method === 'HEAD') return new Response(null, { headers: {
+        'Content-Type': resource.type || 'application/octet-stream', 'Content-Length': String(metadata.size),
+        'Accept-Ranges': 'bytes', 'Content-Disposition': contentDisposition(resource.filename, resource.type),
+        'X-Content-Type-Options': 'nosniff', ETag: metadata.httpEtag,
+      } });
+    }
+    const object = await bucket.get(objectKey, range ? { range } : undefined);
 
     if (!object) {
       return errorResponse('File not found in storage', 404);
@@ -215,10 +237,15 @@ app.get('/:id/file', async (c) => {
 
     // 返回文件内容
     return new Response(object.body, {
+      status: range ? 206 : 200,
       headers: {
         'Content-Type': resource.type || 'application/octet-stream',
-        'Content-Length': resource.size?.toString() || '',
-        'Content-Disposition': `inline; filename="${encodeURIComponent(resource.filename)}"`,
+        'Content-Length': String(range?.length ?? object.size),
+        'Content-Disposition': contentDisposition(resource.filename, resource.type),
+        'Accept-Ranges': 'bytes',
+        ...(range ? { 'Content-Range': `bytes ${range.offset}-${range.offset + range.length - 1}/${object.size}` } : {}),
+        ETag: object.httpEtag,
+        'X-Content-Type-Options': 'nosniff',
         'Cache-Control': 'public, max-age=31536000',
       },
     });
