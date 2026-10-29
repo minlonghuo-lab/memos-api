@@ -31,8 +31,8 @@ app.use('/*', cors({
     return origin || true;
   },
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization', 'X-Token'],
-  exposeHeaders: ['Content-Length', 'Content-Type', 'X-Token'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-Token', 'Range', 'If-Range'],
+  exposeHeaders: ['Content-Length', 'Content-Type', 'X-Token', 'Content-Range', 'Accept-Ranges', 'Content-Disposition', 'ETag'],
   maxAge: 86400,  // 24小时
   credentials: true,  // 支持携带凭证（cookies, authorization headers）
 }));
