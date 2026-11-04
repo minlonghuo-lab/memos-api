@@ -14,6 +14,8 @@ import webhooksApp from './handlers/webhooks';
 import identityProvidersApp from './handlers/identityProviders';
 import telegramApp from './handlers/telegram';
 import { affectsPublicFeed, notifyPublicFeed } from './utils/publicFeed.js';
+import { serveResourceFile } from './utils/resourceFiles.js';
+import { setResourceCacheHeaders } from './utils/resourceAccess.js';
 
 const app = new Hono();
 
@@ -30,12 +32,21 @@ app.use('/*', cors({
     // 如果没有origin（比如同源请求或某些工具），返回true
     return origin || true;
   },
-  allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowMethods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-Token', 'Range', 'If-Range'],
   exposeHeaders: ['Content-Length', 'Content-Type', 'X-Token', 'Content-Range', 'Accept-Ranges', 'Content-Disposition', 'ETag'],
   maxAge: 86400,  // 24小时
   credentials: true,  // 支持携带凭证（cookies, authorization headers）
 }));
+
+// Apply to successes, errors, redirects, metadata and upload/list responses alike.
+app.use('/*', async (c, next) => {
+  await next();
+  if (/^\/api\/v1\/resource(?:\/|$)/.test(c.req.path) ||
+      /^\/o\/r\//.test(c.req.path) || /^\/\d+_\d+\.\w+$/.test(c.req.path)) {
+    setResourceCacheHeaders(c, c.get('publicResourceFile') && c.res.status >= 200 && c.res.status < 300);
+  }
+});
 
 // API 路由
 app.route('/api/v1/auth', authApp);       // 认证路由（新增）
@@ -250,88 +261,18 @@ app.get('/u/:userId/rss.xml', async (c) => {
   return c.redirect(`/api/v1/rss/u/${userId}/rss.xml`, 301);
 });
 
-// 资源文件访问路由 /o/r/:id/:filename
-// 允许通过 /o/r/1/{GUID}.jpg 格式访问资源
-app.get('/o/r/:id/:filename', async (c) => {
-  try {
-    const db = c.env.DB;
-    const bucket = c.env.BUCKET;
-    const id = c.req.param('id');
-
-    const stmt = db.prepare(`
-      SELECT id, filename, filepath, type, size
-      FROM resources
-      WHERE id = ?
-    `);
-
-    const resource = await stmt.bind(id).first();
-
-    if (!resource) {
-      return c.text('Resource not found', 404);
-    }
-
-    // 从 filepath 中提取 R2 对象的 key（文件名）
-    let objectKey = resource.filepath;
-
-    // 如果 filepath 是完整 URL，提取文件名部分
-    if (objectKey.startsWith('http')) {
-      const url = new URL(objectKey);
-      objectKey = url.pathname.substring(1); // 移除开头的 /
-    }
-
-    // 从 R2 获取文件
-    const object = await bucket.get(objectKey);
-
-    if (!object) {
-      return c.text('File not found in storage', 404);
-    }
-
-    // 返回文件内容
-    return new Response(object.body, {
-      headers: {
-        'Content-Type': resource.type || 'application/octet-stream',
-        'Content-Length': resource.size?.toString() || '',
-        'Content-Disposition': `inline; filename="${encodeURIComponent(resource.filename)}"`,
-        'Cache-Control': 'public, max-age=31536000',
-      },
-    });
-  } catch (error) {
-    console.error('Error proxying resource:', error);
-    return c.text('Error accessing resource', 500);
-  }
-});
+// Legacy media URLs must not bypass memo/resource access control.
+app.on(['GET', 'HEAD'], '/o/r/:id/:filename', (c) => serveResourceFile(c));
 
 // 直接文件访问路由：/:filename (例如: /2_1761140800100.jpeg)
 // 这个路由需要放在最后，作为通配符处理文件请求
-app.get('/:filename', async (c) => {
+app.on(['GET', 'HEAD'], '/:filename', async (c) => {
   const filename = c.req.param('filename');
 
-  // 检查文件名格式是否匹配：用户ID_时间戳.后缀
+  // Old raw object URLs are resolved through resources first; untracked R2 keys
+  // are never served. Uploads without a memo association are owner-only.
   if (filename && filename.match(/^\d+_\d+\.\w+$/)) {
-    try {
-      const bucket = c.env.BUCKET;
-
-      // 从 R2 获取文件
-      const object = await bucket.get(filename);
-
-      if (!object) {
-        return c.text('File not found', 404);
-      }
-
-      // 获取文件的 MIME 类型
-      const contentType = object.httpMetadata?.contentType || 'application/octet-stream';
-
-      // 返回文件内容
-      return new Response(object.body, {
-        headers: {
-          'Content-Type': contentType,
-          'Cache-Control': 'public, max-age=31536000',
-        },
-      });
-    } catch (error) {
-      console.error('Error serving file:', error);
-      return c.text('Error serving file', 500);
-    }
+    return serveResourceFile(c, { filepath: filename });
   }
 
   return c.env.ASSETS.fetch(c.req.raw);
