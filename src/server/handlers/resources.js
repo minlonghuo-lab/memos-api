@@ -1,7 +1,8 @@
 import { parsePagination } from '../utils/pagination.js';
 import { Hono } from 'hono';
 import { requireAuth, jsonResponse, errorResponse, ensureDefaultUser } from '../utils/auth';
-import { byteRange, contentDisposition, effectiveFileType } from '../utils/resourceFiles.js';
+import { effectiveFileType, serveResourceFile } from '../utils/resourceFiles.js';
+import { readableResource } from '../utils/resourceAccess.js';
 
 const app = new Hono();
 
@@ -184,100 +185,19 @@ app.get('/', async (c) => {
 // Memos 0.21 / MoeMemos-compatible upload endpoint.
 app.post('/blob', createResourceFromUpload);
 
-// 文件代理路由 - 直接从 R2 读取并返回
-app.on(['GET', 'HEAD'], '/:id/file', async (c) => {
+// Canonical file access shares authorization with legacy media URLs.
+app.on(['GET', 'HEAD'], '/:id/file', (c) => serveResourceFile(c));
+
+// Metadata must not disclose private storage keys or external URLs.
+app.get('/:id', async (c) => {
   try {
-    const db = c.env.DB;
-    const bucket = c.env.BUCKET;
-    const id = c.req.param('id');
-
-    const stmt = db.prepare(`
-      SELECT id, filename, filepath, type, size
-      FROM resources
-      WHERE id = ?
-    `);
-
-    const resource = await stmt.bind(id).first();
-
-    if (!resource) {
-      return errorResponse('Resource not found', 404);
-    }
-
-    resource.type = effectiveFileType(resource.filename, resource.type);
-
-    // 从 filepath 中提取 R2 对象的 key（文件名）
-    let objectKey = resource.filepath;
-
-    // External resources keep their original URL rather than looking up an R2 key.
-    if (objectKey.startsWith('http')) {
-      const url = new URL(objectKey);
+    const { resource, error } = await readableResource(c);
+    if (error) return error;
+    if (resource.filepath.startsWith('http')) {
+      const url = new URL(resource.filepath);
       if (!['http:', 'https:'].includes(url.protocol)) return errorResponse('Invalid resource URL', 400);
       return Response.redirect(url.href, 302);
     }
-
-    const rangeHeader = c.req.header('Range');
-    let range = null;
-    if (rangeHeader || c.req.method === 'HEAD') {
-      const metadata = await bucket.head(objectKey);
-      if (!metadata) return errorResponse('File not found in storage', 404);
-      range = byteRange(c.req.header('If-Range') && c.req.header('If-Range') !== metadata.httpEtag ? null : rangeHeader, metadata.size);
-      if (range === false) return new Response(null, { status: 416,
-        headers: { 'Content-Range': `bytes */${metadata.size}`, 'Accept-Ranges': 'bytes' } });
-      if (c.req.method === 'HEAD') return new Response(null, { headers: {
-        'Content-Type': resource.type || 'application/octet-stream', 'Content-Length': String(metadata.size),
-        'Accept-Ranges': 'bytes', 'Content-Disposition': contentDisposition(resource.filename, resource.type),
-        'X-Content-Type-Options': 'nosniff', ETag: metadata.httpEtag,
-      } });
-    }
-    const object = await bucket.get(objectKey, range ? { range } : undefined);
-
-    if (!object) {
-      return errorResponse('File not found in storage', 404);
-    }
-
-    // 返回文件内容
-    return new Response(object.body, {
-      status: range ? 206 : 200,
-      headers: {
-        'Content-Type': resource.type || 'application/octet-stream',
-        'Content-Length': String(range?.length ?? object.size),
-        'Content-Disposition': contentDisposition(resource.filename, resource.type),
-        'Accept-Ranges': 'bytes',
-        ...(range ? { 'Content-Range': `bytes ${range.offset}-${range.offset + range.length - 1}/${object.size}` } : {}),
-        ETag: object.httpEtag,
-        'X-Content-Type-Options': 'nosniff',
-        'Cache-Control': 'public, max-age=31536000',
-      },
-    });
-  } catch (error) {
-    console.error('Error proxying resource:', error);
-    return errorResponse('Failed to access resource', 500);
-  }
-});
-
-// 获取单个资源 - 无需权限
-app.get('/:id', async (c) => {
-  try {
-    const db = c.env.DB;
-    const id = c.req.param('id');
-    
-    const stmt = db.prepare(`
-      SELECT id, filename, filepath, type, size, created_ts
-      FROM resources
-      WHERE id = ?
-    `);
-    
-    const resource = await stmt.bind(id).first();
-    
-    if (!resource) {
-      return errorResponse('Resource not found', 404);
-    }
-    
-    // 如果是图片，直接重定向到存储的URL
-    if (resource.filepath.startsWith('http')) {
-      return Response.redirect(resource.filepath, 302);
-    }
-    
     return jsonResponse(formatResource(resource, new URL(c.req.url).origin));
   } catch (error) {
     console.error('Error fetching resource:', error);

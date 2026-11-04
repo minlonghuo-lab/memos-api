@@ -51,14 +51,16 @@ test('MoeMemos multipart attachments retain unique bytes, Unicode names, ranges 
   assert.notEqual(a.filepath, b.filepath);
   assert.equal(a.filename, '项目资料.pdf'); assert.equal(a.type, 'application/pdf');
   const url = `http://localhost/api/v1/resource/${a.id}/file`;
-  assert.equal(await (await mf.dispatchFetch(url)).text(), 'first PDF');
-  const range = await mf.dispatchFetch(url, { headers: { Range: 'bytes=1-3' } });
+  const fileHeaders = { Authorization: `Bearer ${jwt}` };
+  assert.equal((await mf.dispatchFetch(url)).status, 404); // New uploads are private orphans.
+  assert.equal(await (await mf.dispatchFetch(url, { headers: fileHeaders })).text(), 'first PDF');
+  const range = await mf.dispatchFetch(url, { headers: { ...fileHeaders, Range: 'bytes=1-3' } });
   assert.equal(range.status, 206); assert.equal(await range.text(), 'irs');
   assert.equal(range.headers.get('content-range'), 'bytes 1-3/9');
   assert.match(range.headers.get('content-disposition'), /filename\*=UTF-8''%E9/);
-  const head = await mf.dispatchFetch(url, { method: 'HEAD' });
+  const head = await mf.dispatchFetch(url, { method: 'HEAD', headers: fileHeaders });
   assert.equal(head.headers.get('content-length'), '9'); assert.equal(await head.text(), '');
-  assert.equal((await mf.dispatchFetch(url, { headers: { Range: 'bytes=999-' } })).status, 416);
+  assert.equal((await mf.dispatchFetch(url, { headers: { ...fileHeaders, Range: 'bytes=999-' } })).status, 416);
   const created = await json('memo', { method: 'POST', body: { content: '', visibility: 'PUBLIC', resourceIdList: [a.id, b.id] } });
   assert.deepEqual(created.resourceList.map(r => r.id), [a.id, b.id]);
   await json(`memo/${created.id}`, { method: 'DELETE' });
@@ -215,4 +217,60 @@ test('invalid attachments are rejected before a memo is inserted', async () => {
   assert.equal(response.status, 400);
   const after = await db.prepare('SELECT COUNT(*) AS count FROM memos').first();
   assert.equal(after.count, before.count);
+});
+
+test('D1/R2 resource permissions follow public/private/protected/archive/unlink changes on canonical and legacy URLs', async () => {
+  const bucket = await mf.getR2Bucket('BUCKET');
+  const key = '1_999999.pdf';
+  await bucket.put(key, 'first PDF');
+  await db.batch([
+    db.prepare("INSERT INTO resources(id,creator_id,filename,filepath,type,size) VALUES(4000,1,'test.pdf',?,'application/pdf',9)").bind(key),
+    db.prepare("INSERT INTO memos(id,creator_id,content,visibility) VALUES(4000,1,'Access test','PRIVATE')"),
+    db.prepare('INSERT INTO memo_resources(memo_id,resource_id) VALUES(4000,4000)'),
+  ]);
+  const other = await generateJWT({ id: 2 }, secret);
+  const urls = ['/api/v1/resource/4000/file', '/o/r/4000/test.pdf', `/${key}`];
+  const fetch = (path, token, options = {}) => mf.dispatchFetch(`http://localhost${path}`, {
+    ...options, headers: { ...options.headers, ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+  });
+  try {
+    for (const path of [...urls, '/api/v1/resource/4000']) {
+      assert.equal((await fetch(path)).status, 404);
+      assert.equal((await fetch(path, other)).status, 404);
+      const owner = await fetch(path, apiToken);
+      assert.equal(owner.status, 200);
+      assert.equal(owner.headers.get('cache-control'), 'private, no-store');
+    }
+    await db.prepare("UPDATE memos SET visibility='PUBLIC' WHERE id=4000").run();
+    for (const path of urls) {
+      assert.equal(await (await fetch(path)).text(), 'first PDF');
+      const range = await fetch(path, null, { headers: { Range: 'bytes=1-3' } });
+      assert.equal(range.status, 206); assert.equal(await range.text(), 'irs');
+      const head = await fetch(path, null, { method: 'HEAD' });
+      assert.equal(head.status, 200); assert.equal(head.headers.get('content-length'), '9');
+    }
+    await db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('disable-public-memos','true')").run();
+    assert.equal((await fetch(urls[0])).status, 404);
+    assert.equal((await fetch(urls[0], other)).status, 200);
+    await db.prepare("DELETE FROM settings WHERE key='disable-public-memos'").run();
+    await db.prepare("UPDATE memos SET visibility='PROTECTED' WHERE id=4000").run();
+    assert.equal((await fetch(urls[0])).status, 404);
+    assert.equal((await fetch(urls[0], other)).status, 200);
+    await db.prepare("UPDATE memos SET visibility='PUBLIC', row_status='ARCHIVED' WHERE id=4000").run();
+    assert.equal((await fetch(urls[0], other)).status, 404);
+    assert.equal((await fetch(urls[0], jwt)).status, 200);
+    await db.prepare('DELETE FROM memo_resources WHERE resource_id=4000').run();
+    for (const path of urls) {
+      assert.equal((await fetch(path)).status, 404);
+      assert.equal((await fetch(path, other)).status, 404);
+      assert.equal((await fetch(path, jwt)).status, 200);
+    }
+  } finally {
+    await db.batch([
+      db.prepare('DELETE FROM memo_resources WHERE resource_id=4000'),
+      db.prepare('DELETE FROM resources WHERE id=4000'), db.prepare('DELETE FROM memos WHERE id=4000'),
+      db.prepare("DELETE FROM settings WHERE key='disable-public-memos'"),
+    ]);
+    await bucket.delete(key);
+  }
 });
