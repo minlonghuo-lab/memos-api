@@ -27,12 +27,18 @@ export async function readableResource(c, { filepath } = {}) {
   ));
   // No administrator bypass: private memo reads are owner-only too.
   if (!allowed) return { error: errorResponse('Resource not found', 404) };
-  return { resource, isPublic: isPublic && !user };
+  // Even credentials not understood by optional auth (cookies or a legacy
+  // environment TOKEN without a user) must never participate in shared caching.
+  const credentials = ['Authorization', 'X-Token', 'Cookie'].some(name => c.req.raw.headers.has(name)) ||
+    new URL(c.req.url).searchParams.has('token');
+  return { resource, isPublic: isPublic && !user && !credentials };
 }
 
 export function setResourceCacheHeaders(c, publicFile = false) {
   const headers = new Headers(c.res.headers);
-  // Public files must be revalidated: visibility/associations can change at any time.
+  // Only the internal, post-authorization Cache API may cache original bytes.
+  // An outer CDN hit must never skip current D1 visibility/association checks.
+  // Public browser copies must be revalidated for the same reason.
   headers.set('Cache-Control', publicFile ? 'public, max-age=0, must-revalidate' : 'private, no-store');
   headers.set('CDN-Cache-Control', 'no-store');
   headers.set('Cloudflare-CDN-Cache-Control', 'no-store');

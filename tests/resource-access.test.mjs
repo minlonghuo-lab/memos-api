@@ -14,7 +14,7 @@ before(async () => {
 function fixture({ visibility = 'PRIVATE', status = 'NORMAL', linked = true, disabled = false, external = false } = {}) {
   const resource = { id: 1, creator_id: 1, filename: '项目.pdf', filepath: external ? 'https://files.example.test/document.pdf?stored=1' : '1_1000.pdf', type: 'application/pdf', size: 9, created_ts: 1 };
   const memos = linked ? [{ creator_id: 1, row_status: status, visibility }] : [];
-  const storage = [];
+  const storage = [], pending = [];
   const DB = { prepare(sql) {
     let values;
     const stmt = { bind(...args) { values = args; return stmt; }, async first() {
@@ -42,10 +42,10 @@ function fixture({ visibility = 'PRIVATE', status = 'NORMAL', linked = true, dis
       return { body: text, size: 9, httpEtag: '"test"' };
     },
   };
-  return { resource, memos, storage, async request(path = '/api/v1/resource/1/file', { user, method = 'GET', headers = {}, query = '' } = {}) {
+  return { resource, memos, storage, BUCKET, drain: () => Promise.all(pending), async request(path = '/api/v1/resource/1/file', { user, method = 'GET', headers = {}, query = '' } = {}) {
     if (user) headers = { ...headers, Authorization: `Bearer ${String.fromCharCode(96 + user).repeat(64)}` };
     return app.fetch(new Request(`http://localhost${path}${query}`, { method, headers }),
-      { DB, BUCKET, ASSETS: { fetch: () => new Response('asset') } }, { waitUntil() {} });
+      { DB, BUCKET, ASSETS: { fetch: () => new Response('asset') } }, { waitUntil(promise) { pending.push(promise); } });
   } };
 }
 const paths = ['/api/v1/resource/1/file', '/api/v1/resource/1', '/o/r/1/项目.pdf', '/1_1000.pdf'];
@@ -181,4 +181,53 @@ test('unregistered raw R2 keys are denied without fetching storage', async () =>
     assert.equal(response.status, 404); privateCache(response);
   }
   assert.deepEqual(f.storage, []);
+});
+
+// Failure injection complements the real Cache API/D1/R2 workerd tests.
+test('cache match/put failures are best-effort and HEAD/GET races do not poison a version key', async t => {
+  const previous = globalThis.caches;
+  t.after(() => { if (previous === undefined) delete globalThis.caches; else globalThis.caches = previous; });
+  for (const failure of ['match', 'put', 'race']) {
+    const f = fixture({ visibility: 'PUBLIC' });
+    let writes = 0;
+    globalThis.caches = { default: {
+      async match() { if (failure === 'match') throw new Error('cache unavailable'); },
+      async put() { writes++; if (failure === 'put') throw new Error('cache full'); },
+    } };
+    if (failure === 'race') f.BUCKET.get = async () => ({ body: 'new bytes', size: 9, httpEtag: '"new"' });
+    const response = await f.request();
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), failure === 'race' ? 'new bytes' : 'first PDF');
+    await f.drain();
+    assert.equal(writes, failure === 'put' ? 1 : 0);
+  }
+});
+
+test('empty credential headers and blank query token bypass cache even without an authenticated user', async t => {
+  const previous = globalThis.caches;
+  t.after(() => { if (previous === undefined) delete globalThis.caches; else globalThis.caches = previous; });
+  globalThis.caches = { default: {
+    match() { assert.fail('credentialed requests must never read the shared cache'); },
+    put() { assert.fail('credentialed requests must never write the shared cache'); },
+  } };
+  const f = fixture({ visibility: 'PUBLIC' });
+  for (const options of [{ headers: { Authorization: '' } }, { headers: { 'X-Token': '' } },
+    { headers: { Cookie: '' } }, { query: '?token=' }]) {
+    const response = await f.request(undefined, options);
+    assert.equal(response.status, 200); privateCache(response); await response.text();
+  }
+});
+
+test('R2 read errors never put an error response into cache', async t => {
+  const previous = globalThis.caches;
+  t.after(() => { if (previous === undefined) delete globalThis.caches; else globalThis.caches = previous; });
+  let writes = 0;
+  globalThis.caches = { default: { async match() {}, async put() { writes++; } } };
+  for (const failure of ['head', 'get']) {
+    const f = fixture({ visibility: 'PUBLIC' });
+    f.BUCKET[failure] = async () => { throw new Error(`injected R2 ${failure} failure`); };
+    const response = await f.request();
+    assert.equal(response.status, 500); privateCache(response); await f.drain();
+  }
+  assert.equal(writes, 0);
 });
